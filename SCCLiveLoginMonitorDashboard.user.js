@@ -8,6 +8,8 @@
 // @match        https://onedrive.live.com/edit*
 // @match        https://excel.officeapps.live.com/*
 // @match        file:///*
+// @updateURL    https://raw.githubusercontent.com/prince-jacob/SCC_Live_Login_Monitor_Dashboard/main/SCCLiveLoginMonitorDashboard.user.js
+// @downloadURL  https://raw.githubusercontent.com/prince-jacob/SCC_Live_Login_Monitor_Dashboard/main/SCCLiveLoginMonitorDashboard.user.js
 // @grant        GM_setClipboard
 // @grant        GM_setValue
 // @grant        GM_getValue
