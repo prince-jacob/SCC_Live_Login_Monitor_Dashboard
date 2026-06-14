@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCC Live Login Monitor Dashboard - NCL1
 // @namespace    prince-scc
-// @version      1.8.5
+// @version      1.8.6
 // @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel tab. Upgraded dashboard UI.
 // @author       Prince Jacob ( Wprijaco )
 // @match        https://staffingcommandcenter-eu.aka.amazon.com/NCL1/*
@@ -14,6 +14,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addValueChangeListener
+// @noframes
 // ==/UserScript==
 
 (function () {
