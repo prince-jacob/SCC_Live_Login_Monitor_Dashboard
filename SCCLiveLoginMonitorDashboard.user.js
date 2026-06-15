@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCC Live Login Monitor Dashboard - NCL1
 // @namespace    prince-scc
-// @version      1.8.7
+// @version      1.8.8
 // @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel tab. Upgraded dashboard UI.
 // @author       Prince Jacob ( Wprijaco )
 // @match        https://staffingcommandcenter-eu.aka.amazon.com/NCL1/*
@@ -20,12 +20,12 @@
 (function () {
   'use strict';
 
-  // Prevent duplicate panels inside embedded OneDrive/Excel frames.
+  // Prevent duplicate execution inside embedded frames.
   if (window.top !== window.self) return;
 
   const CREATOR = 'Prince Jacob ( Wprijaco )';
-  const SCRIPT_VERSION = '1.8.7';
-  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_8_7';
+  const SCRIPT_VERSION = '1.8.8';
+  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_8_8';
 
   const SCC_CHANGE_KEY = 'pj_scc_live_login_changes';
   const SCC_LAYOUT_KEY = 'pj_scc_latest_layout';
@@ -159,54 +159,29 @@
 
     let login = '';
 
-    // Method 1: original SCC employee data-testid.
-    const employeeNode = cell.querySelector(
-      '[data-testid^="floor-plan-employee-"]'
-    );
+    // Best SCC source:
+    // data-testid="floor-plan-employee-hadanieg"
+    const employeeNode = cell.querySelector('[data-testid^="floor-plan-employee-"]');
 
     if (employeeNode) {
       const testId = employeeNode.getAttribute('data-testid') || '';
       login = testId.replace(/^floor-plan-employee-/i, '').trim();
     }
 
-    // Method 2: alternative SCC employee/associate/login data-testid.
+    // If no data-testid, use only the FIRST token.
+    // Example:
+    // "hadanieg 312 wsPickToRebin3_301_01" -> "hadanieg"
     if (!login) {
-      const nodes = [...cell.querySelectorAll('[data-testid]')];
-
-      for (const node of nodes) {
-        const testId = node.getAttribute('data-testid') || '';
-        const match = testId.match(
-          /(?:employee|associate|login)[-_]([a-z0-9.-]+)$/i
-        );
-
-        if (match) {
-          login = match[1];
-          break;
-        }
-      }
+      const firstTokenMatch = text.match(/^([a-z0-9.-]+)/i);
+      login = firstTokenMatch ? firstTokenMatch[1] : '';
     }
 
-    // Method 3: fallback to the first valid login-like visible token.
-    if (!login) {
-      const tokens = text
-        .split(/\s+/)
-        .map(token => token.replace(/[^a-z0-9.-]/gi, ''))
-        .filter(Boolean);
-
-      login = tokens.find(token => {
-        const value = token.toLowerCase();
-
-        return (
-          /^[a-z][a-z0-9.-]{2,20}$/i.test(token) &&
-          !isBadLoginCandidate(value)
-        );
-      }) || '';
-    }
-
+    // Final cleanup
     login = clean(login)
       .replace(/[^a-z0-9.-]/gi, '')
       .trim();
 
+    // Never let workstation strings become logins
     if (isBadLoginCandidate(login)) {
       login = '';
     }
@@ -965,77 +940,146 @@
     showToast(trackingPaused ? 'Tracking paused' : 'Tracking resumed', trackingPaused ? 'error' : 'success');
   }
 
-  // Find station tables by visible content instead of Amazon's generated CSS class.
-  // This is more reliable across different SCC builds and user accounts.
   function getStationTables() {
-    return [...document.querySelectorAll('table')]
-      .filter(table => {
-        const headerText = clean(table.tHead?.innerText || table.innerText);
-        return /\b\d{3}\s*\|\s*Priority\s*\d+/i.test(headerText);
-      });
+    const classMatched = [...document.querySelectorAll(TABLE_SELECTOR)];
+
+    if (classMatched.length) {
+      return classMatched;
+    }
+
+    // Fallback for users receiving a different generated CSS-module class.
+    return [...document.querySelectorAll('table')].filter(table =>
+      /\b\d{3}\s*\|\s*Priority\s*\d+/i.test(clean(table.innerText))
+    );
+  }
+
+  function extractEmployeeLogin(employeeCard) {
+    if (!employeeCard) return '';
+
+    const testId = employeeCard.getAttribute('data-testid') || '';
+    let login = testId.replace(/^floor-plan-employee-/i, '').trim();
+
+    if (!login || login.toLowerCase() === 'login') {
+      const loginNode = employeeCard.querySelector('[data-testid="floor-plan-employee-login"]');
+      login = clean(loginNode?.innerText || '');
+    }
+
+    if (!login) {
+      const firstToken = clean(employeeCard.innerText).match(/^([a-z0-9.-]+)/i);
+      login = firstToken ? firstToken[1] : '';
+    }
+
+    login = clean(login).replace(/[^a-z0-9.-]/gi, '');
+    return isBadLoginCandidate(login) ? '' : login;
+  }
+
+  function extractEmployeeWorkstation(employeeCard) {
+    const text = clean(employeeCard?.innerText || '');
+
+    const packMatch = text.match(/\b(wsPickToRebin\d+_\d+_0[12])\b/i);
+    if (packMatch) return packMatch[1];
+
+    const pickMatch = text.match(/\b(ws-k-[a-z]-\d+-\d+)\b/i);
+    return pickMatch ? pickMatch[1] : '';
+  }
+
+  function nearestStationByScreenPosition(employeeCard, headerCells, stationHeaders) {
+    if (!employeeCard || !headerCells.length || !stationHeaders.length) return 0;
+
+    const employeeRect = employeeCard.getBoundingClientRect();
+    const employeeCenter = employeeRect.left + (employeeRect.width / 2);
+
+    let nearestStation = 0;
+    let nearestDistance = Infinity;
+
+    headerCells.forEach((cell, index) => {
+      const stationInfo = stationHeaders[index];
+      if (!stationInfo) return;
+
+      const rect = cell.getBoundingClientRect();
+      const center = rect.left + (rect.width / 2);
+      const distance = Math.abs(employeeCenter - center);
+
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestStation = stationInfo.station;
+      }
+    });
+
+    return nearestStation;
   }
 
   function captureSccFloorPlan() {
     const tables = getStationTables();
-    const stations = [];
+    const stationMap = new Map();
 
     tables.forEach(table => {
       const headerCells = getDirectCells(table.tHead?.rows?.[0]);
+      const stationHeaders = headerCells.map(cell => parseStationHeader(cell.innerText));
+      const validHeaders = stationHeaders.filter(Boolean);
 
-      const stationHeaders = headerCells
-        .map(cell => parseStationHeader(cell.innerText))
-        .filter(Boolean);
+      if (!validHeaders.length) return;
 
-      if (!stationHeaders.length) return;
-
-      const bodyRows = [];
-
-      [...table.tBodies].forEach(tbody => {
-        [...tbody.rows].forEach(row => {
-          const cells = getDirectCells(row);
-          if (cells.length) bodyRows.push(cells);
-        });
+      validHeaders.forEach(header => {
+        if (!stationMap.has(header.station)) {
+          stationMap.set(header.station, {
+            station: header.station,
+            priority: header.priority,
+            pickLogin: '',
+            pickHref: '',
+            pack1Login: '',
+            pack1Href: '',
+            pack2Login: '',
+            pack2Href: ''
+          });
+        }
       });
 
-      const pickUphRowIndex = bodyRows.findIndex(row =>
-        row.some(cell => /^Pick\s+UPH:/i.test(clean(cell.innerText)))
-      );
+      // Read employee cards directly. This works on both /approved/ and /plan/
+      // pages, including pages where Pick UPH / Pack UPH rows are not rendered.
+      const employeeCards = [...table.querySelectorAll('[data-testid^="floor-plan-employee-"]')]
+        .filter(node => (node.getAttribute('data-testid') || '').toLowerCase() !== 'floor-plan-employee-login');
 
-      const packUphRowIndex = bodyRows.findIndex(row =>
-        row.some(cell => /^Pack\s+UPH:/i.test(clean(cell.innerText)))
-      );
+      employeeCards.forEach(card => {
+        const login = extractEmployeeLogin(card);
+        if (!login) return;
 
-      const pickAssociateRow =
-        pickUphRowIndex >= 0 ? bodyRows[pickUphRowIndex + 1] || [] : [];
+        const workstation = extractEmployeeWorkstation(card);
+        let station = 0;
+        let role = '';
 
-      const packAssociateRow1 =
-        packUphRowIndex >= 0 ? bodyRows[packUphRowIndex + 1] || [] : [];
+        const packMatch = workstation.match(/wsPickToRebin\d+_(\d+)_0([12])/i);
 
-      const packAssociateRow2 =
-        packUphRowIndex >= 0 ? bodyRows[packUphRowIndex + 2] || [] : [];
+        if (packMatch) {
+          station = Number(packMatch[1]);
+          role = packMatch[2] === '1' ? 'pack1' : 'pack2';
+        } else {
+          // Picker workstations do not include the wall station number.
+          // Use the card's actual screen column and match it to the nearest
+          // station header, which is stable on both SCC page variants.
+          station = nearestStationByScreenPosition(card, headerCells, stationHeaders);
+          role = 'pick';
+        }
 
-      stationHeaders.forEach((header, index) => {
-        const picker = parseAssociateCell(pickAssociateRow[index]);
-        const packer1 = parseAssociateCell(packAssociateRow1[index]);
-        const packer2 = parseAssociateCell(packAssociateRow2[index]);
+        if (!station || !stationMap.has(station)) return;
 
-        stations.push({
-          station: header.station,
-          priority: header.priority,
+        const row = stationMap.get(station);
+        const href = makeEmployeeHref(login);
 
-          pickLogin: picker.login,
-          pickHref: picker.href,
-
-          pack1Login: packer1.login,
-          pack1Href: packer1.href,
-
-          pack2Login: packer2.login,
-          pack2Href: packer2.href
-        });
+        if (role === 'pick') {
+          row.pickLogin = login;
+          row.pickHref = href;
+        } else if (role === 'pack1') {
+          row.pack1Login = login;
+          row.pack1Href = href;
+        } else if (role === 'pack2') {
+          row.pack2Login = login;
+          row.pack2Href = href;
+        }
       });
     });
 
-    return stations.sort((a, b) => a.station - b.station);
+    return [...stationMap.values()].sort((a, b) => a.station - b.station);
   }
 
   function detectWallName(stations) {
@@ -1088,12 +1132,6 @@
     }
 
     return { wallName, rows };
-  }
-
-  function hasAnyLogin(rows) {
-    return Array.isArray(rows) && rows.some(row =>
-      row.pickLogin || row.pack1Login || row.pack2Login
-    );
   }
 
   function formatCell(value) {
@@ -1263,6 +1301,10 @@
     });
   }
 
+  function hasAnyLogin(rows) {
+    return rows.some(row => row.pickLogin || row.pack1Login || row.pack2Login);
+  }
+
   function checkForLoginChanges() {
     if (trackingPaused || checkingNow) return;
     checkingNow = true;
@@ -1345,23 +1387,13 @@
 
     if (!initialiseWhenReady()) {
       const readyTimer = setInterval(() => {
-        if (initialiseWhenReady()) {
-          clearInterval(readyTimer);
-        }
+        if (initialiseWhenReady()) clearInterval(readyTimer);
       }, 1000);
     }
   }
 
   function resetChangeTracking() {
     const result = getAutoWallRows();
-
-    if (!result.wallName || !result.rows.length || !hasAnyLogin(result.rows)) {
-      const status = document.getElementById('pj-scc-status');
-      if (status) {
-        status.textContent = 'No login data available yet. Wait for SCC to finish loading.';
-      }
-      return;
-    }
 
     lastSnapshot = result.rows;
     changeHistory = [];
@@ -1393,9 +1425,9 @@
     }
 
     if (status) {
-      status.textContent = result.wallName && hasAnyLogin(result.rows)
+      status.textContent = result.wallName
         ? `${result.wallName} ready. Logins of Picker | Packer 1 | Packer 2.`
-        : 'Waiting for SCC station login data...';
+        : 'Waiting for visible floor plan station cards...';
     }
 
     console.table(result.rows);
@@ -1404,8 +1436,8 @@
   async function copyPreview() {
     const result = getAutoWallRows();
 
-    if (!result.rows.length || !result.wallName || !hasAnyLogin(result.rows)) {
-      alert('No floor plan login data found yet. Wait for SCC to finish loading, then click Recheck.');
+    if (!result.rows.length || !result.wallName) {
+      alert('No floor plan station data found.');
       return;
     }
 
@@ -1538,9 +1570,7 @@
   }
 
   function waitForFloorPlan() {
-    const tables = getStationTables();
-
-    if (tables.length) {
+    if (getStationTables().length) {
       addSccPanel();
     }
   }
