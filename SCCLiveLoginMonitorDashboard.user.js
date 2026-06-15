@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCC Live Login Monitor Dashboard - NCL1
 // @namespace    prince-scc
-// @version      1.8.6
+// @version      1.8.7
 // @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel tab. Upgraded dashboard UI.
 // @author       Prince Jacob ( Wprijaco )
 // @match        https://staffingcommandcenter-eu.aka.amazon.com/NCL1/*
@@ -20,9 +20,12 @@
 (function () {
   'use strict';
 
+  // Prevent duplicate panels inside embedded OneDrive/Excel frames.
+  if (window.top !== window.self) return;
+
   const CREATOR = 'Prince Jacob ( Wprijaco )';
-  const SCRIPT_VERSION = '1.8.5';
-  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_8_5';
+  const SCRIPT_VERSION = '1.8.7';
+  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_8_6';
 
   const SCC_CHANGE_KEY = 'pj_scc_live_login_changes';
   const SCC_LAYOUT_KEY = 'pj_scc_latest_layout';
@@ -156,29 +159,54 @@
 
     let login = '';
 
-    // Best SCC source:
-    // data-testid="floor-plan-employee-hadanieg"
-    const employeeNode = cell.querySelector('[data-testid^="floor-plan-employee-"]');
+    // Method 1: original SCC employee data-testid.
+    const employeeNode = cell.querySelector(
+      '[data-testid^="floor-plan-employee-"]'
+    );
 
     if (employeeNode) {
       const testId = employeeNode.getAttribute('data-testid') || '';
       login = testId.replace(/^floor-plan-employee-/i, '').trim();
     }
 
-    // If no data-testid, use only the FIRST token.
-    // Example:
-    // "hadanieg 312 wsPickToRebin3_301_01" -> "hadanieg"
+    // Method 2: alternative SCC employee/associate/login data-testid.
     if (!login) {
-      const firstTokenMatch = text.match(/^([a-z0-9.-]+)/i);
-      login = firstTokenMatch ? firstTokenMatch[1] : '';
+      const nodes = [...cell.querySelectorAll('[data-testid]')];
+
+      for (const node of nodes) {
+        const testId = node.getAttribute('data-testid') || '';
+        const match = testId.match(
+          /(?:employee|associate|login)[-_]([a-z0-9.-]+)$/i
+        );
+
+        if (match) {
+          login = match[1];
+          break;
+        }
+      }
     }
 
-    // Final cleanup
+    // Method 3: fallback to the first valid login-like visible token.
+    if (!login) {
+      const tokens = text
+        .split(/\s+/)
+        .map(token => token.replace(/[^a-z0-9.-]/gi, ''))
+        .filter(Boolean);
+
+      login = tokens.find(token => {
+        const value = token.toLowerCase();
+
+        return (
+          /^[a-z][a-z0-9.-]{2,20}$/i.test(token) &&
+          !isBadLoginCandidate(value)
+        );
+      }) || '';
+    }
+
     login = clean(login)
       .replace(/[^a-z0-9.-]/gi, '')
       .trim();
 
-    // Never let workstation strings become logins
     if (isBadLoginCandidate(login)) {
       login = '';
     }
@@ -937,8 +965,18 @@
     showToast(trackingPaused ? 'Tracking paused' : 'Tracking resumed', trackingPaused ? 'error' : 'success');
   }
 
+  // Find station tables by visible content instead of Amazon's generated CSS class.
+  // This is more reliable across different SCC builds and user accounts.
+  function getStationTables() {
+    return [...document.querySelectorAll('table')]
+      .filter(table => {
+        const headerText = clean(table.tHead?.innerText || table.innerText);
+        return /\b\d{3}\s*\|\s*Priority\s*\d+/i.test(headerText);
+      });
+  }
+
   function captureSccFloorPlan() {
-    const tables = [...document.querySelectorAll(TABLE_SELECTOR)];
+    const tables = getStationTables();
     const stations = [];
 
     tables.forEach(table => {
@@ -1050,6 +1088,12 @@
     }
 
     return { wallName, rows };
+  }
+
+  function hasAnyLogin(rows) {
+    return Array.isArray(rows) && rows.some(row =>
+      row.pickLogin || row.pack1Login || row.pack2Login
+    );
   }
 
   function formatCell(value) {
@@ -1225,7 +1269,7 @@
 
     const result = getAutoWallRows();
 
-    if (!result.rows.length || !result.wallName) {
+    if (!result.rows.length || !result.wallName || !hasAnyLogin(result.rows)) {
       checkingNow = false;
       return;
     }
@@ -1279,21 +1323,45 @@
   function startChangeTracking() {
     if (trackingTimer) return;
 
-    const result = getAutoWallRows();
-    lastSnapshot = result.rows;
+    const initialiseWhenReady = () => {
+      const result = getAutoWallRows();
 
-    GM_setValue(SCC_LAYOUT_KEY, {
-      time: new Date().toLocaleTimeString(),
-      wallName: result.wallName,
-      rows: result.rows
-    });
+      if (!result.wallName || !result.rows.length || !hasAnyLogin(result.rows)) {
+        return false;
+      }
 
-    trackingTimer = setInterval(checkForLoginChanges, TRACK_INTERVAL_MS);
-    renderChangeHistory();
+      lastSnapshot = result.rows;
+
+      GM_setValue(SCC_LAYOUT_KEY, {
+        time: new Date().toLocaleTimeString(),
+        wallName: result.wallName,
+        rows: result.rows
+      });
+
+      trackingTimer = setInterval(checkForLoginChanges, TRACK_INTERVAL_MS);
+      renderChangeHistory();
+      return true;
+    };
+
+    if (!initialiseWhenReady()) {
+      const readyTimer = setInterval(() => {
+        if (initialiseWhenReady()) {
+          clearInterval(readyTimer);
+        }
+      }, 1000);
+    }
   }
 
   function resetChangeTracking() {
     const result = getAutoWallRows();
+
+    if (!result.wallName || !result.rows.length || !hasAnyLogin(result.rows)) {
+      const status = document.getElementById('pj-scc-status');
+      if (status) {
+        status.textContent = 'No login data available yet. Wait for SCC to finish loading.';
+      }
+      return;
+    }
 
     lastSnapshot = result.rows;
     changeHistory = [];
@@ -1325,9 +1393,9 @@
     }
 
     if (status) {
-      status.textContent = result.wallName
+      status.textContent = result.wallName && hasAnyLogin(result.rows)
         ? `${result.wallName} ready. Logins of Picker | Packer 1 | Packer 2.`
-        : 'Waiting for visible floor plan station cards...';
+        : 'Waiting for SCC station login data...';
     }
 
     console.table(result.rows);
@@ -1336,8 +1404,8 @@
   async function copyPreview() {
     const result = getAutoWallRows();
 
-    if (!result.rows.length || !result.wallName) {
-      alert('No floor plan station data found.');
+    if (!result.rows.length || !result.wallName || !hasAnyLogin(result.rows)) {
+      alert('No floor plan login data found yet. Wait for SCC to finish loading, then click Recheck.');
       return;
     }
 
@@ -1470,9 +1538,9 @@
   }
 
   function waitForFloorPlan() {
-    const hasFloorPlanTables = document.querySelector(TABLE_SELECTOR);
+    const tables = getStationTables();
 
-    if (hasFloorPlanTables) {
+    if (tables.length) {
       addSccPanel();
     }
   }
