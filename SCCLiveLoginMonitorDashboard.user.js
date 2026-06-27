@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         SCC Live Login Monitor Dashboard - NCL1
 // @namespace    prince-scc
-// @version      1.8.8
-// @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel tab. Upgraded dashboard UI.
+// @version      1.8.9
+// @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel and P2R Tracker pages. Upgraded dashboard UI.
 // @author       Prince Jacob ( Wprijaco )
 // @match        https://staffingcommandcenter-eu.aka.amazon.com/NCL1/*
 // @match        https://onedrive.live.com/edit*
 // @match        https://excel.officeapps.live.com/*
+// @match        https://p2r-tracker.web.app/*
 // @match        file:///*
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/SCC_Live_Login_Monitor_Dashboard/main/SCCLiveLoginMonitorDashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/SCC_Live_Login_Monitor_Dashboard/main/SCCLiveLoginMonitorDashboard.user.js
@@ -24,8 +25,8 @@
   if (window.top !== window.self) return;
 
   const CREATOR = 'Prince Jacob ( Wprijaco )';
-  const SCRIPT_VERSION = '1.8.8';
-  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_8_8';
+  const SCRIPT_VERSION = '1.8.9';
+  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_8_9';
 
   const SCC_CHANGE_KEY = 'pj_scc_live_login_changes';
   const SCC_LAYOUT_KEY = 'pj_scc_latest_layout';
@@ -68,7 +69,14 @@
 
   function isExcelPage() {
     return location.href.includes('onedrive.live.com/edit') ||
-           location.href.includes('excel.officeapps.live.com');
+           location.href.includes('excel.officeapps.live.com') ||
+           location.href.includes('p2r-tracker.web.app');
+  }
+
+  function getHelperPageName() {
+    if (location.href.includes('p2r-tracker.web.app')) return 'P2R Tracker';
+    if (location.href.includes('onedrive.live.com') || location.href.includes('excel.officeapps.live.com')) return 'Excel';
+    return 'Helper Page';
   }
 
   function clean(text) {
@@ -1579,6 +1587,8 @@
     if (!isExcelPage()) return;
     if (document.getElementById('pj-scc-live-window')) return;
 
+    const helperPageName = getHelperPageName();
+
     injectExcelStyles();
 
     const panel = document.createElement('div');
@@ -1588,7 +1598,7 @@
       <div class="pj-live-header">
         <div>
           <div class="pj-live-title">SCC Live Changes</div>
-          <div class="pj-live-subtitle">Login Change monitor | v${escapeHtml(SCRIPT_VERSION)}</div>
+          <div class="pj-live-subtitle">${escapeHtml(helperPageName)} helper | v${escapeHtml(SCRIPT_VERSION)}</div>
         </div>
         <button class="pj-live-min" id="pj-live-min-btn">−</button>
       </div>
@@ -1596,6 +1606,10 @@
       <div class="pj-live-body">
         <div class="pj-live-status" id="pj-live-status">
           Waiting for SCC login changes...
+        </div>
+
+        <div class="pj-live-status" style="background:rgba(16,185,129,0.10) !important;border-color:rgba(16,185,129,0.22) !important;color:#d1fae5 !important;">
+          Use <b>Copy Latest Layout</b>, then paste directly into ${escapeHtml(helperPageName)}.
         </div>
 
         <div class="pj-live-actions">
@@ -1660,11 +1674,11 @@
           GM_setClipboard(text);
         }
 
-        statusBox.textContent = `${data.wallName} latest layout copied with FCLM links. Paste into Excel.`;
+        statusBox.textContent = `${data.wallName} latest layout copied with FCLM links. Paste into ${helperPageName}.`;
       } catch (err) {
         console.error('Excel helper copy failed:', err);
         GM_setClipboard(text);
-        statusBox.textContent = `${data.wallName} latest layout copied as plain text.`;
+        statusBox.textContent = `${data.wallName} latest layout copied as plain text. Paste into ${helperPageName}.`;
       }
     }
 
