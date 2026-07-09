@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SCC Live Login Monitor Dashboard - NCL1
 // @namespace    prince-scc
-// @version      1.8.9
-// @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel and P2R Tracker pages. Upgraded dashboard UI.
+// @version      1.9.0
+// @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel and P2R Tracker pages, with optional P2R auto-apply. Upgraded dashboard UI.
 // @author       Prince Jacob ( Wprijaco )
 // @match        https://staffingcommandcenter-eu.aka.amazon.com/NCL1/*
 // @match        https://onedrive.live.com/edit*
@@ -25,12 +25,17 @@
   if (window.top !== window.self) return;
 
   const CREATOR = 'Prince Jacob ( Wprijaco )';
-  const SCRIPT_VERSION = '1.8.9';
-  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_8_9';
+  const SCRIPT_VERSION = '1.9.0';
+  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_9_0';
 
   const SCC_CHANGE_KEY = 'pj_scc_live_login_changes';
   const SCC_LAYOUT_KEY = 'pj_scc_latest_layout';
   const SCC_EXCEL_LOG_KEY = 'pj_scc_excel_log';
+
+  const P2R_AUTO_APPLY_KEY = 'pj_scc_p2r_auto_apply_v190';
+  const P2R_DB_BASE = 'https://p2r-tracker-default-rtdb.europe-west1.firebasedatabase.app';
+  let p2rApplying = false;
+  let p2rLastAppliedSignature = '';
 
   const STORAGE_MINIMISED = 'pj_scc_panel_minimised_v18';
   const STORAGE_EXCEL_MINIMISED = 'pj_scc_excel_panel_minimised_v18';
@@ -77,6 +82,10 @@
     if (location.href.includes('p2r-tracker.web.app')) return 'P2R Tracker';
     if (location.href.includes('onedrive.live.com') || location.href.includes('excel.officeapps.live.com')) return 'Excel';
     return 'Helper Page';
+  }
+
+  function isP2RTrackerPage() {
+    return location.href.includes('p2r-tracker.web.app');
   }
 
   function clean(text) {
@@ -1583,6 +1592,234 @@
     }
   }
 
+
+  function p2rRoleFromSccRole(role) {
+    const value = String(role || '').toLowerCase().replace(/\s+/g, '');
+    if (value === 'pick') return 'pick';
+    if (value === 'pack1') return 'pack1';
+    if (value === 'pack2') return 'pack2';
+    return '';
+  }
+
+  function p2rSlotKey(floor, station, role) {
+    return `${floor}|${Number(station)}|${role}`;
+  }
+
+  function p2rLayoutSignature(data) {
+    if (!data || !data.rows) return '';
+    return [
+      data.wallName || '',
+      ...data.rows.map(row => [
+        row.station || '',
+        row.pickLogin || '',
+        row.pack1Login || '',
+        row.pack2Login || ''
+      ].join(':'))
+    ].join('|').toLowerCase();
+  }
+
+  function p2rDefaultPerson(login) {
+    return {
+      login,
+      name: '',
+      manager: '',
+      pick: false,
+      pack: false,
+      stow: false,
+      decant: false,
+      arsaw: false,
+      singles: false,
+      vendors: false,
+      icqa: false,
+      ws: false,
+      ship: false,
+      afeSort: false,
+      restriction: 'Any',
+      lastBoardChangeAt: 0,
+      leave: 'full',
+      floor: '',
+      station: '',
+      role: 'offplan',
+      inDirectory: false
+    };
+  }
+
+  function p2rNormalizePeople(data) {
+    const source = Array.isArray(data) ? data : data ? Object.values(data) : [];
+
+    return source
+      .filter(item => item && item.login)
+      .map(item => ({
+        ...p2rDefaultPerson(String(item.login || '').trim()),
+        ...item,
+        login: String(item.login || '').trim(),
+        station: item.station === '' || item.station == null ? '' : Number(item.station)
+      }));
+  }
+
+  async function p2rFetchJson(path, options = {}) {
+    const url = `${P2R_DB_BASE}/${path}.json`;
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options.headers || {})
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`P2R Firebase ${response.status}: ${await response.text()}`);
+    }
+
+    if (options.method === 'PUT' || options.method === 'PATCH') {
+      try {
+        return await response.json();
+      } catch {
+        return null;
+      }
+    }
+
+    return response.json();
+  }
+
+  function p2rBuildTargetsFromLayout(data) {
+    const targets = [];
+
+    if (!data || !data.wallName || !Array.isArray(data.rows)) {
+      return targets;
+    }
+
+    data.rows.forEach(row => {
+      [
+        { login: row.pickLogin, role: 'pick' },
+        { login: row.pack1Login, role: 'pack1' },
+        { login: row.pack2Login, role: 'pack2' }
+      ].forEach(item => {
+        const login = clean(item.login);
+        if (!login || isBadLoginCandidate(login)) return;
+
+        targets.push({
+          login,
+          loginKey: login.toLowerCase(),
+          floor: data.wallName,
+          station: Number(row.station),
+          role: item.role
+        });
+      });
+    });
+
+    return targets;
+  }
+
+  async function p2rApplySccLayout(data, statusBox, sourceLabel = 'manual') {
+    if (!isP2RTrackerPage()) return false;
+
+    if (p2rApplying) {
+      if (statusBox) statusBox.textContent = 'P2R auto apply already running...';
+      return false;
+    }
+
+    if (!data || !data.wallName || !Array.isArray(data.rows) || !data.rows.length) {
+      if (statusBox) statusBox.textContent = 'No SCC layout ready to apply to P2R Tracker.';
+      return false;
+    }
+
+    const signature = p2rLayoutSignature(data);
+
+    if (sourceLabel === 'auto' && signature && signature === p2rLastAppliedSignature) {
+      return false;
+    }
+
+    const targets = p2rBuildTargetsFromLayout(data);
+
+    if (!targets.length) {
+      if (statusBox) statusBox.textContent = `${data.wallName || 'Wall'} has no logins to apply yet.`;
+      return false;
+    }
+
+    p2rApplying = true;
+
+    try {
+      if (statusBox) statusBox.textContent = `Applying ${data.wallName} SCC layout to P2R Tracker...`;
+
+      const remotePeople = await p2rFetchJson('people');
+      const people = p2rNormalizePeople(remotePeople);
+
+      const floor = data.wallName;
+      const trackedRoles = new Set(['pick', 'pack1', 'pack2']);
+      const targetByLogin = new Map();
+      const targetSlotToLogin = new Map();
+
+      targets.forEach(target => {
+        targetByLogin.set(target.loginKey, target);
+        targetSlotToLogin.set(p2rSlotKey(target.floor, target.station, target.role), target.loginKey);
+      });
+
+      // Clear old pick/pack slots on the same floor that are no longer matching the SCC layout.
+      people.forEach(person => {
+        const role = String(person.role || '');
+        const loginKey = String(person.login || '').toLowerCase();
+        const slotKey = p2rSlotKey(person.floor, person.station, role);
+
+        if (person.floor === floor && trackedRoles.has(role)) {
+          const wantedLoginForSlot = targetSlotToLogin.get(slotKey);
+
+          if (wantedLoginForSlot !== loginKey) {
+            person.floor = '';
+            person.station = '';
+            person.role = 'offplan';
+            person.lastBoardChangeAt = 0;
+          }
+        }
+      });
+
+      // Apply every SCC slot to P2R. Existing occupants were cleared above.
+      targets.forEach(target => {
+        let person = people.find(item =>
+          String(item.login || '').toLowerCase() === target.loginKey
+        );
+
+        if (!person) {
+          person = p2rDefaultPerson(target.login);
+          people.push(person);
+        }
+
+        person.floor = target.floor;
+        person.station = target.station;
+        person.role = target.role;
+
+        if (!person.leave) person.leave = 'full';
+        if (!person.restriction) person.restriction = 'Any';
+        person.lastBoardChangeAt = Date.now();
+      });
+
+      localStorage.setItem('hc-planner-people', JSON.stringify(people));
+      await p2rFetchJson('people', {
+        method: 'PUT',
+        body: JSON.stringify(people)
+      });
+
+      p2rLastAppliedSignature = signature;
+
+      if (statusBox) {
+        statusBox.textContent = `${data.wallName} applied to P2R Tracker: ${targets.length} login slot(s) updated.`;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('P2R auto apply failed:', error);
+
+      if (statusBox) {
+        statusBox.textContent = `P2R auto apply failed: ${error.message || error}`;
+      }
+
+      return false;
+    } finally {
+      p2rApplying = false;
+    }
+  }
+
+
   function runExcelLiveWindow() {
     if (!isExcelPage()) return;
     if (document.getElementById('pj-scc-live-window')) return;
@@ -1614,6 +1851,8 @@
 
         <div class="pj-live-actions">
           <button class="pj-live-btn pj-copy-latest" id="pj-live-copy-layout">Copy Latest Layout</button>
+          ${isP2RTrackerPage() ? `<button class="pj-live-btn pj-copy-latest" id="pj-p2r-apply-now">Apply to P2R</button>` : ``}
+          ${isP2RTrackerPage() ? `<button class="pj-live-btn pj-clear-log" id="pj-p2r-auto-toggle">Auto Apply: OFF</button>` : ``}
           <button class="pj-live-btn pj-copy-latest" id="pj-live-copy-changes">Copy Changes</button>
           <button class="pj-live-btn pj-clear-log" id="pj-live-clear-log">Clear</button>
         </div>
@@ -1634,6 +1873,8 @@
     const clearBtn = document.getElementById('pj-live-clear-log');
     const copyBtn = document.getElementById('pj-live-copy-layout');
     const copyChangesBtn = document.getElementById('pj-live-copy-changes');
+    const p2rApplyNowBtn = document.getElementById('pj-p2r-apply-now');
+    const p2rAutoToggleBtn = document.getElementById('pj-p2r-auto-toggle');
 
     let logs = GM_getValue(SCC_EXCEL_LOG_KEY, []);
 
@@ -1699,6 +1940,22 @@
       statusBox.textContent = `Copied ${logs.length} change log item(s).`;
     }
 
+    function p2rAutoApplyEnabled() {
+      return GM_getValue(P2R_AUTO_APPLY_KEY, false) === true;
+    }
+
+    function updateP2RAutoButton() {
+      if (!p2rAutoToggleBtn) return;
+      const enabled = p2rAutoApplyEnabled();
+      p2rAutoToggleBtn.textContent = enabled ? 'Auto Apply: ON' : 'Auto Apply: OFF';
+      p2rAutoToggleBtn.style.background = enabled ? '#047857' : '#334155';
+    }
+
+    async function p2rApplyLatestFromHelper(sourceLabel = 'manual') {
+      const latestLayout = GM_getValue(SCC_LAYOUT_KEY);
+      return p2rApplySccLayout(latestLayout, statusBox, sourceLabel);
+    }
+
     GM_addValueChangeListener(SCC_CHANGE_KEY, (name, oldValue, newValue) => {
       if (!newValue || !newValue.changes) return;
 
@@ -1716,6 +1973,10 @@
       logs = logs.slice(0, 100);
       GM_setValue(SCC_EXCEL_LOG_KEY, logs);
       renderLogs();
+
+      if (isP2RTrackerPage() && p2rAutoApplyEnabled()) {
+        setTimeout(() => p2rApplyLatestFromHelper('auto'), 250);
+      }
     });
 
     GM_addValueChangeListener(SCC_LAYOUT_KEY, (name, oldValue, newValue) => {
@@ -1723,6 +1984,10 @@
 
       if (!logs.length) {
         statusBox.textContent = `${newValue.wallName || 'Wall'} layout received at ${newValue.time}. Waiting for changes...`;
+      }
+
+      if (isP2RTrackerPage() && p2rAutoApplyEnabled()) {
+        setTimeout(() => p2rApplySccLayout(newValue, statusBox, 'auto'), 250);
       }
     });
 
@@ -1744,6 +2009,22 @@
     copyBtn.addEventListener('click', copyLatestLayout);
     copyChangesBtn.addEventListener('click', copyExcelChanges);
 
+    if (p2rApplyNowBtn) {
+      p2rApplyNowBtn.addEventListener('click', () => p2rApplyLatestFromHelper('manual'));
+    }
+
+    if (p2rAutoToggleBtn) {
+      updateP2RAutoButton();
+      p2rAutoToggleBtn.addEventListener('click', () => {
+        const next = !p2rAutoApplyEnabled();
+        GM_setValue(P2R_AUTO_APPLY_KEY, next);
+        updateP2RAutoButton();
+        statusBox.textContent = next
+          ? 'P2R Auto Apply enabled. SCC moves will update this tracker page automatically.'
+          : 'P2R Auto Apply disabled.';
+      });
+    }
+
     const savedMin = localStorage.getItem(STORAGE_EXCEL_MINIMISED) === '1';
     if (savedMin) {
       panel.classList.add('min');
@@ -1758,6 +2039,10 @@
     }
 
     renderLogs();
+
+    if (isP2RTrackerPage() && p2rAutoApplyEnabled() && latest) {
+      setTimeout(() => p2rApplySccLayout(latest, statusBox, 'auto'), 600);
+    }
 
     makePanelDraggable('pj-scc-live-window', '.pj-live-header', STORAGE_EXCEL_LEFT, STORAGE_EXCEL_TOP);
     rememberPanelSize('pj-scc-live-window', STORAGE_EXCEL_WIDTH, STORAGE_EXCEL_HEIGHT, () => panel.classList.contains('min'));
