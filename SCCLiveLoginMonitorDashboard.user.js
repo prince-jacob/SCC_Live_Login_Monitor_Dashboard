@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCC Live Login Monitor Dashboard - NCL1
 // @namespace    prince-scc
-// @version      1.9.0
+// @version      1.9.1
 // @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel and P2R Tracker pages, with optional P2R auto-apply. Upgraded dashboard UI.
 // @author       Prince Jacob ( Wprijaco )
 // @match        https://staffingcommandcenter-eu.aka.amazon.com/NCL1/*
@@ -16,6 +16,9 @@
 // @grant        GM_getValue
 // @grant        GM_addValueChangeListener
 // @noframes
+// @grant        GM_xmlhttpRequest
+// @grant        GM_info
+// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 (function () {
@@ -25,8 +28,8 @@
   if (window.top !== window.self) return;
 
   const CREATOR = 'Prince Jacob ( Wprijaco )';
-  const SCRIPT_VERSION = '1.9.0';
-  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_9_0';
+  const SCRIPT_VERSION = '1.9.1';
+  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_9_1';
 
   const SCC_CHANGE_KEY = 'pj_scc_live_login_changes';
   const SCC_LAYOUT_KEY = 'pj_scc_latest_layout';
@@ -2047,6 +2050,78 @@
     makePanelDraggable('pj-scc-live-window', '.pj-live-header', STORAGE_EXCEL_LEFT, STORAGE_EXCEL_TOP);
     rememberPanelSize('pj-scc-live-window', STORAGE_EXCEL_WIDTH, STORAGE_EXCEL_HEIGHT, () => panel.classList.contains('min'));
   }
+
+
+  // ===== Prince Jacob Custom Update Checker - Every 10 Hours =====
+  function princeUpdateChecker() {
+    const UPDATE_URL = "https://raw.githubusercontent.com/prince-jacob/SCC_Live_Login_Monitor_Dashboard/main/SCCLiveLoginMonitorDashboard.user.js";
+    const CHECK_KEY = "prince_last_update_check_" + GM_info.script.name;
+    const CHECK_INTERVAL = 10 * 60 * 60 * 1000; // 10 hours
+
+    const lastCheck = Number(GM_getValue(CHECK_KEY, 0));
+    const now = Date.now();
+
+    if (now - lastCheck < CHECK_INTERVAL) {
+      return;
+    }
+
+    GM_setValue(CHECK_KEY, now);
+
+    GM_xmlhttpRequest({
+      method: "GET",
+      url: UPDATE_URL,
+      nocache: true,
+      onload: function (res) {
+        const remoteScript = res.responseText || "";
+        const remoteMatch = remoteScript.match(/\/\/\s*@version\s+([0-9.]+)/i);
+
+        if (!remoteMatch) {
+          console.log("[Update Checker] Remote version not found.");
+          return;
+        }
+
+        const remoteVersion = remoteMatch[1];
+        const currentVersion = GM_info.script.version;
+
+        if (isNewerVersion(remoteVersion, currentVersion)) {
+          const openUpdate = confirm(
+            "New script update available!\n\n" +
+            "Script: " + GM_info.script.name + "\n" +
+            "Current version: " + currentVersion + "\n" +
+            "New version: " + remoteVersion + "\n\n" +
+            "Open update page now?"
+          );
+
+          if (openUpdate) {
+            window.open(UPDATE_URL, "_blank");
+          }
+        } else {
+          console.log("[Update Checker] Up to date:", currentVersion);
+        }
+      },
+      onerror: function () {
+        console.log("[Update Checker] Failed to check update.");
+      }
+    });
+
+    function isNewerVersion(remote, current) {
+      const r = String(remote).split(".").map(Number);
+      const c = String(current).split(".").map(Number);
+      const len = Math.max(r.length, c.length);
+
+      for (let i = 0; i < len; i++) {
+        const rv = r[i] || 0;
+        const cv = c[i] || 0;
+
+        if (rv > cv) return true;
+        if (rv < cv) return false;
+      }
+
+      return false;
+    }
+  }
+
+  princeUpdateChecker();
 
   if (isExcelPage()) {
     runExcelLiveWindow();
