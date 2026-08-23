@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SCC Live Login Monitor Dashboard - NCL1
 // @namespace    prince-scc
-// @version      1.9.1
-// @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel and P2R Tracker pages, with optional P2R auto-apply. Upgraded dashboard UI.
+// @version      1.9.5
+// @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel and P2R Tracker pages, with optional P2R auto-apply, SCC trained-role capture, and longer hover role popup and strict P2R Pick/P2R Pack role filters on P2R Tracker. Upgraded dashboard UI.
 // @author       Prince Jacob ( Wprijaco )
 // @match        https://staffingcommandcenter-eu.aka.amazon.com/NCL1/*
 // @match        https://onedrive.live.com/edit*
@@ -28,14 +28,17 @@
   if (window.top !== window.self) return;
 
   const CREATOR = 'Prince Jacob ( Wprijaco )';
-  const SCRIPT_VERSION = '1.9.1';
-  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_9_1';
+  const SCRIPT_VERSION = '1.9.5';
+  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_9_5';
 
   const SCC_CHANGE_KEY = 'pj_scc_live_login_changes';
   const SCC_LAYOUT_KEY = 'pj_scc_latest_layout';
   const SCC_EXCEL_LOG_KEY = 'pj_scc_excel_log';
+  const SCC_TRAINING_KEY = 'pj_scc_login_trained_roles_v192';
 
   const P2R_AUTO_APPLY_KEY = 'pj_scc_p2r_auto_apply_v190';
+  const P2R_ROLE_HIGHLIGHT_KEY = 'pj_scc_p2r_role_highlight_v192';
+  const P2R_ROLE_FILTER_KEY = 'pj_scc_p2r_role_filter_v194';
   const P2R_DB_BASE = 'https://p2r-tracker-default-rtdb.europe-west1.firebasedatabase.app';
   let p2rApplying = false;
   let p2rLastAppliedSignature = '';
@@ -54,6 +57,7 @@
   const STORAGE_EXCEL_HEIGHT = 'pj_scc_excel_panel_height_v18';
 
   const TRACK_INTERVAL_MS = 5000;
+  const TRAINING_REFRESH_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 
   const WALLS = {
     P1: { start: 101, end: 116 },
@@ -69,6 +73,12 @@
   let trackingTimer = null;
   let trackingPaused = false;
   let checkingNow = false;
+  let sccTrainingByLogin = GM_getValue(SCC_TRAINING_KEY, {}) || {};
+  let sccTrainingUpdatedAt = 0;
+  let sccTrainingRefreshPromise = null;
+  let sccTrainingTimer = null;
+  let p2rRoleHighlightTimer = null;
+  let p2rRoleTooltipHideTimer = null;
 
   function isSccPage() {
     return location.href.startsWith('https://staffingcommandcenter-eu.aka.amazon.com/NCL1/') ||
@@ -960,6 +970,201 @@
     showToast(trackingPaused ? 'Tracking paused' : 'Tracking resumed', trackingPaused ? 'error' : 'success');
   }
 
+  function loginKey(login) {
+    return clean(login).toLowerCase();
+  }
+
+  function trainedRoleLabel(role) {
+    const value = String(role || '').trim();
+    const upper = value.toUpperCase();
+
+    const labels = {
+      P2R_PICK: 'P2R Pick',
+      P2R_PACK: 'P2R Pack',
+      AFE_PACK: 'AFE Pack',
+      AFE_REBIN: 'AFE Rebin',
+      AFE_PACK_GW: 'Gift Wrap',
+      PICK_AR: 'AR Pick',
+      STOW: 'Stow',
+      DECANT: 'Decant',
+      ICQA_SIMPLE_RECORD_COUNT: 'ICQA',
+      ICQA_SIMPLE_BIN_COUNT: 'ICQA',
+      ICQA_CYCLE_COUNT: 'ICQA',
+      PP_SINGLE_SMALL: 'Singles',
+      PPSINGLESMALL: 'Singles',
+      PPSINGLEMEDIUM: 'Singles',
+      SHIP_DOCK: 'Ship Dock'
+    };
+
+    return labels[upper] || value.replace(/_/g, ' ').replace(/\b\w/g, char => char.toUpperCase());
+  }
+
+  function normalizeTrainedRoles(roles) {
+    const list = Array.isArray(roles) ? roles : [];
+    const unique = [];
+    const seen = new Set();
+
+    list.forEach(role => {
+      const value = String(role || '').trim();
+      const key = value.toUpperCase();
+      if (!value || seen.has(key)) return;
+      seen.add(key);
+      unique.push(value);
+    });
+
+    const order = [
+      'P2R_PICK', 'P2R_PACK', 'AFE_REBIN', 'AFE_PACK', 'AFE_PACK_GW',
+      'PICK_AR', 'STOW', 'DECANT', 'PPSINGLESMALL', 'PPSINGLEMEDIUM',
+      'ICQA_SIMPLE_RECORD_COUNT', 'ICQA_SIMPLE_BIN_COUNT', 'ICQA_CYCLE_COUNT',
+      'SHIP_DOCK'
+    ];
+
+    unique.sort((a, b) => {
+      const ia = order.indexOf(String(a).toUpperCase());
+      const ib = order.indexOf(String(b).toUpperCase());
+      return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+    });
+
+    return unique;
+  }
+
+  function trainingInfoForLogin(login) {
+    const key = loginKey(login);
+    if (!key) return null;
+    return sccTrainingByLogin[key] || null;
+  }
+
+  function canDoP2RRole(roles, boardRole) {
+    const set = new Set((Array.isArray(roles) ? roles : []).map(role => String(role).toUpperCase()));
+    const role = String(boardRole || '').toLowerCase();
+
+    if (role === 'pick') return set.has('P2R_PICK');
+    if (role === 'pack1' || role === 'pack2') return set.has('P2R_PACK');
+    return false;
+  }
+
+  function shortTrainingLabel(roles, boardRole = '') {
+    const set = new Set((Array.isArray(roles) ? roles : []).map(role => String(role).toUpperCase()));
+    const parts = [];
+
+    if (set.has('P2R_PICK')) parts.push('P2R Pick');
+    if (set.has('P2R_PACK')) parts.push('P2R Pack');
+    if (set.has('AFE_PACK')) parts.push('AFE Pack');
+    if (set.has('AFE_REBIN')) parts.push('AFE Rebin');
+    if (set.has('AFE_PACK_GW')) parts.push('Gift');
+    if (set.has('PICK_AR')) parts.push('AR Pick');
+    if (set.has('STOW')) parts.push('Stow');
+
+    if (!parts.length) {
+      return normalizeTrainedRoles(roles).slice(0, 2).map(trainedRoleLabel).join(' / ');
+    }
+
+    return parts.slice(0, 3).join(' / ');
+  }
+
+  function attachTrainingToRows(rows) {
+    return (rows || []).map(row => {
+      const pickTraining = trainingInfoForLogin(row.pickLogin);
+      const pack1Training = trainingInfoForLogin(row.pack1Login);
+      const pack2Training = trainingInfoForLogin(row.pack2Login);
+
+      return {
+        ...row,
+        pickTrainingRoles: pickTraining?.trained || [],
+        pack1TrainingRoles: pack1Training?.trained || [],
+        pack2TrainingRoles: pack2Training?.trained || []
+      };
+    });
+  }
+
+  function buildSccLayoutPayload(wallName, rows, time = new Date().toLocaleTimeString()) {
+    return {
+      time,
+      wallName,
+      rows: attachTrainingToRows(rows || []),
+      trainingByLogin: sccTrainingByLogin || {},
+      trainingUpdatedAt: sccTrainingUpdatedAt || 0
+    };
+  }
+
+  async function refreshSccTrainingCache(force = false, statusBox = null) {
+    if (!location.hostname.includes('staffingcommandcenter-eu.aka.amazon.com')) {
+      return sccTrainingByLogin;
+    }
+
+    const now = Date.now();
+    if (!force && sccTrainingUpdatedAt && now - sccTrainingUpdatedAt < TRAINING_REFRESH_INTERVAL_MS) {
+      return sccTrainingByLogin;
+    }
+
+    if (sccTrainingRefreshPromise) {
+      return sccTrainingRefreshPromise;
+    }
+
+    if (statusBox) statusBox.textContent = 'Refreshing trained roles from SCC...';
+
+    sccTrainingRefreshPromise = (async () => {
+      const [profileResponse, trainingResponse] = await Promise.all([
+        fetch('/getAssociateProfileDetails/NCL1', { credentials: 'include', cache: 'no-store' }),
+        fetch('/getAssociateTrainedRoles/NCL1', { credentials: 'include', cache: 'no-store' })
+      ]);
+
+      if (!profileResponse.ok) throw new Error(`Profile details ${profileResponse.status}`);
+      if (!trainingResponse.ok) throw new Error(`Trained roles ${trainingResponse.status}`);
+
+      const profiles = await profileResponse.json();
+      const training = await trainingResponse.json();
+      const mapped = {};
+
+      Object.entries(profiles || {}).forEach(([employeeId, profile]) => {
+        const login = clean(profile?.employeeLogin || profile?.login || '');
+        if (!login) return;
+
+        const trained = normalizeTrainedRoles(training?.[employeeId]?.trained || []);
+        mapped[login.toLowerCase()] = {
+          login,
+          trained,
+          labels: trained.map(trainedRoleLabel),
+          canP2RPick: canDoP2RRole(trained, 'pick'),
+          canP2RPack: canDoP2RRole(trained, 'pack1')
+        };
+      });
+
+      sccTrainingByLogin = mapped;
+      sccTrainingUpdatedAt = Date.now();
+      GM_setValue(SCC_TRAINING_KEY, mapped);
+
+      const current = getAutoWallRows();
+      if (current.wallName && current.rows.length) {
+        GM_setValue(SCC_LAYOUT_KEY, buildSccLayoutPayload(current.wallName, current.rows));
+      }
+
+      if (statusBox) {
+        statusBox.textContent = `Trained roles refreshed: ${Object.keys(mapped).length} login(s) cached.`;
+      }
+
+      return mapped;
+    })().catch(error => {
+      console.error('SCC trained role refresh failed:', error);
+      if (statusBox) statusBox.textContent = `Trained role refresh failed: ${error.message || error}`;
+      return sccTrainingByLogin;
+    }).finally(() => {
+      sccTrainingRefreshPromise = null;
+    });
+
+    return sccTrainingRefreshPromise;
+  }
+
+  function startSccTrainingRefreshLoop() {
+    if (!location.hostname.includes('staffingcommandcenter-eu.aka.amazon.com')) return;
+    if (sccTrainingTimer) return;
+
+    refreshSccTrainingCache(false).catch(console.error);
+    sccTrainingTimer = setInterval(() => {
+      refreshSccTrainingCache(false).catch(console.error);
+    }, TRAINING_REFRESH_INTERVAL_MS);
+  }
+
   function getStationTables() {
     const classMatched = [...document.querySelectorAll(TABLE_SELECTOR)];
 
@@ -1151,7 +1356,7 @@
       });
     }
 
-    return { wallName, rows };
+    return { wallName, rows: attachTrainingToRows(rows) };
   }
 
   function formatCell(value) {
@@ -1308,11 +1513,7 @@
   }
 
   function sendToExcelLiveWindow(wallName, rows, changes, time) {
-    GM_setValue(SCC_LAYOUT_KEY, {
-      time,
-      wallName,
-      rows
-    });
+    GM_setValue(SCC_LAYOUT_KEY, buildSccLayoutPayload(wallName, rows, time));
 
     GM_setValue(SCC_CHANGE_KEY, {
       time,
@@ -1338,11 +1539,7 @@
 
     if (!lastSnapshot) {
       lastSnapshot = result.rows;
-      GM_setValue(SCC_LAYOUT_KEY, {
-        time: new Date().toLocaleTimeString(),
-        wallName: result.wallName,
-        rows: result.rows
-      });
+      GM_setValue(SCC_LAYOUT_KEY, buildSccLayoutPayload(result.wallName, result.rows));
       renderChangeHistory();
       checkingNow = false;
       return;
@@ -1372,11 +1569,7 @@
       showToast(`${changes.length} login change(s) detected`, 'success');
       refreshPreview();
     } else {
-      GM_setValue(SCC_LAYOUT_KEY, {
-        time: new Date().toLocaleTimeString(),
-        wallName: result.wallName,
-        rows: result.rows
-      });
+      GM_setValue(SCC_LAYOUT_KEY, buildSccLayoutPayload(result.wallName, result.rows));
     }
 
     checkingNow = false;
@@ -1394,11 +1587,7 @@
 
       lastSnapshot = result.rows;
 
-      GM_setValue(SCC_LAYOUT_KEY, {
-        time: new Date().toLocaleTimeString(),
-        wallName: result.wallName,
-        rows: result.rows
-      });
+      GM_setValue(SCC_LAYOUT_KEY, buildSccLayoutPayload(result.wallName, result.rows));
 
       trackingTimer = setInterval(checkForLoginChanges, TRACK_INTERVAL_MS);
       renderChangeHistory();
@@ -1418,11 +1607,7 @@
     lastSnapshot = result.rows;
     changeHistory = [];
 
-    GM_setValue(SCC_LAYOUT_KEY, {
-      time: new Date().toLocaleTimeString(),
-      wallName: result.wallName,
-      rows: result.rows
-    });
+    GM_setValue(SCC_LAYOUT_KEY, buildSccLayoutPayload(result.wallName, result.rows));
 
     renderChangeHistory();
 
@@ -1537,6 +1722,7 @@
         <div class="pj-scc-actions">
           <button class="pj-scc-btn pj-copy-btn" id="pj-copy-btn">Copy</button>
           <button class="pj-scc-btn pj-recheck-btn" id="pj-recheck-btn">Recheck</button>
+          <button class="pj-scc-btn pj-recheck-btn" id="pj-refresh-roles-btn">Refresh Roles</button>
           <button class="pj-scc-btn pj-recheck-btn" id="pj-reset-track-btn">Reset Track</button>
           <button class="pj-scc-btn pj-pause-btn" id="pj-pause-track-btn">Pause</button>
           <button class="pj-scc-btn pj-copy-changes-btn" id="pj-copy-changes-btn">Copy Changes</button>
@@ -1567,6 +1753,7 @@
 
     document.getElementById('pj-copy-btn').addEventListener('click', copyPreview);
     document.getElementById('pj-recheck-btn').addEventListener('click', refreshPreview);
+    document.getElementById('pj-refresh-roles-btn').addEventListener('click', () => refreshSccTrainingCache(true, document.getElementById('pj-scc-status')));
     document.getElementById('pj-reset-track-btn').addEventListener('click', resetChangeTracking);
     document.getElementById('pj-pause-track-btn').addEventListener('click', toggleTrackingPause);
     document.getElementById('pj-copy-changes-btn').addEventListener('click', copyLatestChanges);
@@ -1587,6 +1774,7 @@
     rememberPanelSize('pj-scc-panel', STORAGE_SCC_WIDTH, STORAGE_SCC_HEIGHT, () => localStorage.getItem(STORAGE_MINIMISED) === '1');
 
     startChangeTracking();
+    startSccTrainingRefreshLoop();
   }
 
   function waitForFloorPlan() {
@@ -1823,6 +2011,525 @@
   }
 
 
+  function p2rRoleHighlightEnabled() {
+    return GM_getValue(P2R_ROLE_HIGHLIGHT_KEY, false) === true;
+  }
+
+  function p2rGetTrainingMapFromStorage() {
+    const latest = GM_getValue(SCC_LAYOUT_KEY, null);
+    const fromLayout = latest?.trainingByLogin;
+    const fromTrainingKey = GM_getValue(SCC_TRAINING_KEY, {});
+    return (fromLayout && Object.keys(fromLayout).length) ? fromLayout : (fromTrainingKey || {});
+  }
+
+  function injectP2RRoleHighlightStyles() {
+    if (!isP2RTrackerPage() || document.getElementById('pj-p2r-role-highlight-style')) return;
+
+    const style = document.createElement('style');
+    style.id = 'pj-p2r-role-highlight-style';
+    style.textContent = `
+      .aa-tile.pj-scc-role-trained,
+      .aa-tile.pj-scc-role-other {
+        position: relative !important;
+        transition: box-shadow .16s ease, outline-color .16s ease, transform .16s ease !important;
+      }
+
+      /* Main colour code:
+         Green = P2R Pick trained
+         Blue = P2R Pack trained
+         Purple = both P2R Pick + P2R Pack trained
+         Orange = trained roles exist, but not P2R Pick/Pack
+      */
+      .aa-tile.pj-scc-role-pick {
+        outline: 2px solid rgba(34,197,94,.98) !important;
+        box-shadow: 0 0 0 2px rgba(34,197,94,.14) !important;
+      }
+
+      .aa-tile.pj-scc-role-pack {
+        outline: 2px solid rgba(37,99,235,.98) !important;
+        box-shadow: 0 0 0 2px rgba(37,99,235,.16) !important;
+      }
+
+      .aa-tile.pj-scc-role-both {
+        outline: 2px solid rgba(124,58,237,.98) !important;
+        box-shadow: 0 0 0 2px rgba(124,58,237,.17) !important;
+      }
+
+      .aa-tile.pj-scc-role-other-training {
+        outline: 2px solid rgba(245,158,11,.95) !important;
+        box-shadow: 0 0 0 2px rgba(245,158,11,.16) !important;
+      }
+
+      .aa-tile.pj-scc-role-slot-mismatch {
+        box-shadow: inset 0 0 0 2px rgba(245,158,11,.75), 0 0 0 2px rgba(245,158,11,.12) !important;
+      }
+
+      .aa-tile.pj-scc-role-trained::after,
+      .aa-tile.pj-scc-role-other::after {
+        position: absolute !important;
+        top: 3px !important;
+        right: 4px !important;
+        z-index: 5 !important;
+        min-width: 17px !important;
+        height: 16px !important;
+        padding: 0 4px !important;
+        border-radius: 999px !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        color: #fff !important;
+        font-family: "Segoe UI", Arial, sans-serif !important;
+        font-size: 9px !important;
+        font-weight: 900 !important;
+        line-height: 16px !important;
+        pointer-events: none !important;
+      }
+
+      .aa-tile.pj-scc-role-pick::after {
+        content: "P" !important;
+        background: #16a34a !important;
+      }
+
+      .aa-tile.pj-scc-role-pack::after {
+        content: "PK" !important;
+        background: #2563eb !important;
+      }
+
+      .aa-tile.pj-scc-role-both::after {
+        content: "B" !important;
+        background: #7c3aed !important;
+      }
+
+      .aa-tile.pj-scc-role-other-training::after {
+        content: "i" !important;
+        background: #d97706 !important;
+      }
+
+      .aa-tile.pj-scc-role-hovered {
+        transform: translateY(-1px) !important;
+        z-index: 40 !important;
+      }
+
+      #pj-p2r-role-tooltip {
+        position: fixed !important;
+        z-index: 2147483647 !important;
+        display: none !important;
+        width: 285px !important;
+        max-width: min(285px, calc(100vw - 24px)) !important;
+        padding: 11px 12px !important;
+        border-radius: 12px !important;
+        background: rgba(15, 23, 42, .985) !important;
+        border: 1px solid rgba(255,255,255,.16) !important;
+        box-shadow: 0 14px 34px rgba(0,0,0,.38) !important;
+        color: #e5e7eb !important;
+        font-family: "Segoe UI", Arial, sans-serif !important;
+        font-size: 13px !important;
+        line-height: 1.4 !important;
+        pointer-events: none !important;
+      }
+
+      #pj-p2r-role-tooltip.show {
+        display: block !important;
+      }
+
+      .pj-p2r-role-tip-login {
+        font-size: 16px !important;
+        font-weight: 900 !important;
+        color: #fff !important;
+        margin-bottom: 4px !important;
+        letter-spacing: .2px !important;
+      }
+
+      .pj-p2r-role-tip-row {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        gap: 8px !important;
+        margin: 6px 0 !important;
+      }
+
+      .pj-p2r-role-tip-label {
+        color: #cbd5e1 !important;
+        font-size: 12px !important;
+        font-weight: 700 !important;
+      }
+
+      .pj-p2r-role-tip-status {
+        display: inline-flex !important;
+        align-items: center !important;
+        gap: 6px !important;
+        padding: 4px 8px !important;
+        border-radius: 999px !important;
+        color: #fff !important;
+        font-size: 11px !important;
+        font-weight: 900 !important;
+        white-space: nowrap !important;
+      }
+
+      .pj-p2r-role-tip-status.ok {
+        background: #15803d !important;
+      }
+
+      .pj-p2r-role-tip-status.warn {
+        background: #b45309 !important;
+      }
+
+      .pj-p2r-role-tip-muted {
+        color: #94a3b8 !important;
+        font-size: 11px !important;
+        margin-top: 7px !important;
+        margin-bottom: 6px !important;
+      }
+
+      .pj-p2r-role-chip-wrap {
+        display: flex !important;
+        flex-wrap: wrap !important;
+        gap: 5px !important;
+        margin-top: 6px !important;
+      }
+
+      .pj-p2r-role-chip {
+        display: inline-flex !important;
+        align-items: center !important;
+        border-radius: 999px !important;
+        padding: 4px 8px !important;
+        color: #fff !important;
+        font-size: 11px !important;
+        font-weight: 900 !important;
+        font-family: "Segoe UI", Arial, sans-serif !important;
+        white-space: nowrap !important;
+      }
+
+      .pj-p2r-role-chip.pick { background: #16a34a !important; }
+      .pj-p2r-role-chip.pack { background: #2563eb !important; }
+      .pj-p2r-role-chip.both { background: #7c3aed !important; }
+      .pj-p2r-role-chip.rebin { background: #7c3aed !important; }
+      .pj-p2r-role-chip.gift { background: #db2777 !important; }
+      .pj-p2r-role-chip.icqa { background: #0891b2 !important; }
+      .pj-p2r-role-chip.single { background: #475569 !important; }
+      .pj-p2r-role-chip.other { background: #64748b !important; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function p2rRoleChipClass(role) {
+    const value = String(role || '').toUpperCase();
+
+    // Strict P2R-only colour coding.
+    // ARSAW / AR Pick / Pick_AR must NOT count as P2R Pick.
+    // AFE Pack / other Pack roles must NOT count as P2R Pack.
+    if (value === 'P2R_PICK' || value.includes('P2R_PICK')) return 'pick';
+    if (value === 'P2R_PACK' || value.includes('P2R_PACK')) return 'pack';
+    if (value.includes('REBIN')) return 'rebin';
+    if (value.includes('GW') || value.includes('GIFT')) return 'gift';
+    if (value.includes('ICQA') || value.includes('COUNT')) return 'icqa';
+    if (value.includes('SINGLE')) return 'single';
+
+    return 'other';
+  }
+
+  function p2rHasPickTraining(roles) {
+    const set = new Set((Array.isArray(roles) ? roles : []).map(role => String(role).toUpperCase()));
+
+    // STRICT: only P2R Pick counts.
+    // Do not count PICK_AR / ARSAW Pick / generic Pick.
+    return set.has('P2R_PICK');
+  }
+
+  function p2rHasPackTraining(roles) {
+    const set = new Set((Array.isArray(roles) ? roles : []).map(role => String(role).toUpperCase()));
+
+    // STRICT: only P2R Pack counts.
+    // Do not count AFE Pack / generic Pack.
+    return set.has('P2R_PACK');
+  }
+
+  function p2rTrainingCategory(roles) {
+    const hasPick = p2rHasPickTraining(roles);
+    const hasPack = p2rHasPackTraining(roles);
+
+    if (hasPick && hasPack) return 'both';
+    if (hasPick) return 'pick';
+    if (hasPack) return 'pack';
+
+    return 'other';
+  }
+
+  function p2rRoleFilterMode() {
+    const mode = GM_getValue(P2R_ROLE_FILTER_KEY, 'all');
+    return ['all', 'pick', 'pack', 'both'].includes(mode) ? mode : 'all';
+  }
+
+  function p2rRoleFilterLabel(mode = p2rRoleFilterMode()) {
+    const labels = {
+      all: 'Show: All Roles',
+      pick: 'Show: P2R Pick',
+      pack: 'Show: P2R Pack',
+      both: 'Show: Both P2R'
+    };
+
+    return labels[mode] || labels.all;
+  }
+
+  function p2rNextRoleFilterMode(mode = p2rRoleFilterMode()) {
+    const order = ['all', 'pick', 'pack', 'both'];
+    const index = order.indexOf(mode);
+    return order[(index + 1) % order.length];
+  }
+
+  function p2rRolePassesFilter(roles, filterMode = p2rRoleFilterMode()) {
+    const category = p2rTrainingCategory(roles);
+
+    if (filterMode === 'all') return true;
+    if (filterMode === 'pick') return category === 'pick' || category === 'both';
+    if (filterMode === 'pack') return category === 'pack' || category === 'both';
+    if (filterMode === 'both') return category === 'both';
+
+    return true;
+  }
+
+  function p2rRoleCategoryLabel(category) {
+    if (category === 'both') return 'P2R Pick + P2R Pack trained';
+    if (category === 'pick') return 'P2R Pick trained';
+    if (category === 'pack') return 'P2R Pack trained';
+    return 'Other trained role';
+  }
+
+  function p2rCancelRoleTooltipHide() {
+    if (p2rRoleTooltipHideTimer) {
+      clearTimeout(p2rRoleTooltipHideTimer);
+      p2rRoleTooltipHideTimer = null;
+    }
+  }
+
+  function p2rScheduleRoleTooltipHide(tile = null, delay = 3000) {
+    p2rCancelRoleTooltipHide();
+
+    p2rRoleTooltipHideTimer = setTimeout(() => {
+      p2rHideRoleTooltip(tile);
+    }, delay);
+  }
+
+  function p2rRemoveRoleTooltip() {
+    p2rCancelRoleTooltipHide();
+    const tip = document.getElementById('pj-p2r-role-tooltip');
+    if (tip) tip.remove();
+  }
+
+  function p2rEnsureRoleTooltip() {
+    let tip = document.getElementById('pj-p2r-role-tooltip');
+
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.id = 'pj-p2r-role-tooltip';
+      document.body.appendChild(tip);
+    }
+
+    return tip;
+  }
+
+  function p2rShowRoleTooltip(tile, event = null) {
+    if (!tile || !p2rRoleHighlightEnabled()) return;
+
+    p2rCancelRoleTooltipHide();
+
+    const login = tile.getAttribute('data-pj-scc-login') || tile.dataset.login || '';
+    const fullLabel = tile.getAttribute('data-pj-scc-trained-roles') || '';
+    const boardRole = tile.getAttribute('data-pj-scc-board-role') || '';
+    const matched = tile.getAttribute('data-pj-scc-role-match') === '1';
+    const category = tile.getAttribute('data-pj-scc-role-category') || 'other';
+    const trainedRaw = (tile.getAttribute('data-pj-scc-trained-raw') || '')
+      .split('|')
+      .map(x => x.trim())
+      .filter(Boolean);
+
+    const tip = p2rEnsureRoleTooltip();
+    const statusText = matched ? 'Matches current slot' : 'Does not match current slot';
+
+    tip.innerHTML = `
+      <div class="pj-p2r-role-tip-login">${escapeHtml(login || 'Unknown login')}</div>
+      <div class="pj-p2r-role-tip-row">
+        <span class="pj-p2r-role-tip-label">Role type</span>
+        <span class="pj-p2r-role-chip ${escapeHtml(category === 'both' ? 'both' : category)}">
+          ${escapeHtml(p2rRoleCategoryLabel(category))}
+        </span>
+      </div>
+      <div class="pj-p2r-role-tip-row">
+        <span class="pj-p2r-role-tip-label">Current slot</span>
+        <span class="pj-p2r-role-tip-status ${matched ? 'ok' : 'warn'}">${escapeHtml(boardRole || 'Unknown')} • ${escapeHtml(statusText)}</span>
+      </div>
+      <div class="pj-p2r-role-tip-muted">Trained roles</div>
+      <div class="pj-p2r-role-chip-wrap">
+        ${trainedRaw.map(role => `
+          <span class="pj-p2r-role-chip ${escapeHtml(p2rRoleChipClass(role))}">
+            ${escapeHtml(trainedRoleLabel(role))}
+          </span>
+        `).join('') || `<span class="pj-p2r-role-chip other">${escapeHtml(fullLabel || 'Role data')}</span>`}
+      </div>
+    `;
+
+    const rect = tile.getBoundingClientRect();
+    const preferredX = event?.clientX ? event.clientX + 14 : rect.left + rect.width + 10;
+    const preferredY = event?.clientY ? event.clientY + 14 : rect.top;
+
+    tip.classList.add('show');
+
+    const tipRect = tip.getBoundingClientRect();
+    let left = preferredX;
+    let top = preferredY;
+
+    if (left + tipRect.width + 10 > window.innerWidth) {
+      left = Math.max(10, rect.left - tipRect.width - 10);
+    }
+
+    if (top + tipRect.height + 10 > window.innerHeight) {
+      top = Math.max(10, window.innerHeight - tipRect.height - 10);
+    }
+
+    tip.style.left = `${Math.max(10, left)}px`;
+    tip.style.top = `${Math.max(10, top)}px`;
+  }
+
+  function p2rHideRoleTooltip(tile = null) {
+    if (tile) tile.classList.remove('pj-scc-role-hovered');
+
+    const tip = document.getElementById('pj-p2r-role-tooltip');
+    if (tip) tip.classList.remove('show');
+  }
+
+  function p2rClearRoleHighlights(removeTooltip = true) {
+    document.querySelectorAll('.aa-tile[data-pj-scc-login], .aa-tile.pj-scc-role-trained, .aa-tile.pj-scc-role-other').forEach(tile => {
+      tile.classList.remove(
+        'pj-scc-role-trained',
+        'pj-scc-role-other',
+        'pj-scc-role-hovered',
+        'pj-scc-role-pick',
+        'pj-scc-role-pack',
+        'pj-scc-role-both',
+        'pj-scc-role-other-training',
+        'pj-scc-role-slot-match',
+        'pj-scc-role-slot-mismatch'
+      );
+
+      tile.removeAttribute('data-pj-scc-trained-roles');
+      tile.removeAttribute('data-pj-scc-trained-raw');
+      tile.removeAttribute('data-pj-scc-board-role');
+      tile.removeAttribute('data-pj-scc-role-match');
+      tile.removeAttribute('data-pj-scc-role-category');
+      tile.removeAttribute('data-pj-scc-login');
+      tile.querySelectorAll('.pj-scc-role-badge').forEach(badge => badge.remove());
+
+      tile.onmouseenter = null;
+      tile.onmousemove = null;
+      tile.onmouseleave = null;
+      tile.onclick = null;
+    });
+
+    if (removeTooltip) p2rRemoveRoleTooltip();
+  }
+
+  function p2rApplyRoleHighlights(statusBox = null) {
+    if (!isP2RTrackerPage()) return;
+
+    injectP2RRoleHighlightStyles();
+
+    // Do not remove the tooltip during normal refresh; this prevents fast disappearing while hovering.
+    p2rClearRoleHighlights(false);
+
+    if (!p2rRoleHighlightEnabled()) {
+      p2rClearRoleHighlights(true);
+      return;
+    }
+
+    const trainingMap = p2rGetTrainingMapFromStorage();
+    const keys = Object.keys(trainingMap || {});
+
+    if (!keys.length) {
+      if (statusBox) statusBox.textContent = 'Role hover ON, but no SCC trained-role data received yet. Keep SCC page open and click Refresh Roles.';
+      return;
+    }
+
+    const filterMode = p2rRoleFilterMode();
+    let highlighted = 0;
+    let matched = 0;
+    let pickCount = 0;
+    let packCount = 0;
+    let bothCount = 0;
+    let otherCount = 0;
+
+    document.querySelectorAll('.aa-tile[data-login]').forEach(tile => {
+      const login = clean(tile.dataset.login || tile.querySelector('.login')?.textContent || '');
+      const info = trainingMap[login.toLowerCase()];
+      const trained = normalizeTrainedRoles(info?.trained || info?.roles || []);
+      if (!login || !trained.length) return;
+
+      if (!p2rRolePassesFilter(trained, filterMode)) return;
+
+      const slot = tile.closest('.slot[data-role]');
+      const boardRole = slot?.dataset?.role || '';
+      const roleMatched = canDoP2RRole(trained, boardRole);
+      const fullLabel = trained.map(trainedRoleLabel).join(', ');
+      const category = p2rTrainingCategory(trained);
+
+      tile.classList.add('pj-scc-role-trained');
+      tile.classList.add(`pj-scc-role-${category === 'other' ? 'other-training' : category}`);
+      tile.classList.add(roleMatched ? 'pj-scc-role-slot-match' : 'pj-scc-role-slot-mismatch');
+
+      tile.setAttribute('data-pj-scc-login', login);
+      tile.setAttribute('data-pj-scc-trained-roles', fullLabel);
+      tile.setAttribute('data-pj-scc-trained-raw', trained.join('|'));
+      tile.setAttribute('data-pj-scc-board-role', boardRole || 'Unknown');
+      tile.setAttribute('data-pj-scc-role-match', roleMatched ? '1' : '0');
+      tile.setAttribute('data-pj-scc-role-category', category);
+      tile.title = `${login} • ${p2rRoleCategoryLabel(category)} • ${fullLabel}`;
+
+      tile.onmouseenter = event => {
+        tile.classList.add('pj-scc-role-hovered');
+        p2rShowRoleTooltip(tile, event);
+      };
+
+      tile.onmousemove = event => {
+        p2rShowRoleTooltip(tile, event);
+      };
+
+      tile.onmouseleave = () => {
+        // Keep popup visible for a while after leaving the tile.
+        p2rScheduleRoleTooltipHide(tile, 3200);
+      };
+
+      tile.onclick = event => {
+        // Touch/tablet fallback: tap a highlighted tile to show the same role card longer.
+        tile.classList.add('pj-scc-role-hovered');
+        p2rShowRoleTooltip(tile, event);
+        p2rScheduleRoleTooltipHide(tile, 9000);
+      };
+
+      highlighted += 1;
+      if (roleMatched) matched += 1;
+
+      if (category === 'both') bothCount += 1;
+      else if (category === 'pick') pickCount += 1;
+      else if (category === 'pack') packCount += 1;
+      else otherCount += 1;
+    });
+
+    if (statusBox) {
+      statusBox.textContent =
+        `${p2rRoleFilterLabel(filterMode)} active: ${highlighted} marked | Pick ${pickCount}, Pack ${packCount}, Both ${bothCount}, Other ${otherCount}. Hover/tap marker for details.`;
+    }
+  }
+
+  function startP2RRoleHighlightLoop(statusBox = null) {
+    if (!isP2RTrackerPage() || p2rRoleHighlightTimer) return;
+
+    p2rRoleHighlightTimer = setInterval(() => {
+      if (p2rRoleHighlightEnabled()) p2rApplyRoleHighlights(statusBox);
+    }, 5000);
+
+    setTimeout(() => p2rApplyRoleHighlights(statusBox), 300);
+  }
+
+
   function runExcelLiveWindow() {
     if (!isExcelPage()) return;
     if (document.getElementById('pj-scc-live-window')) return;
@@ -1856,6 +2563,8 @@
           <button class="pj-live-btn pj-copy-latest" id="pj-live-copy-layout">Copy Latest Layout</button>
           ${isP2RTrackerPage() ? `<button class="pj-live-btn pj-copy-latest" id="pj-p2r-apply-now">Apply to P2R</button>` : ``}
           ${isP2RTrackerPage() ? `<button class="pj-live-btn pj-clear-log" id="pj-p2r-auto-toggle">Auto Apply: OFF</button>` : ``}
+          ${isP2RTrackerPage() ? `<button class="pj-live-btn pj-copy-latest" id="pj-p2r-role-highlight-toggle">Role Hover: OFF</button>` : ``}
+          ${isP2RTrackerPage() ? `<button class="pj-live-btn pj-clear-log" id="pj-p2r-role-filter-toggle">Show: All Roles</button>` : ``}
           <button class="pj-live-btn pj-copy-latest" id="pj-live-copy-changes">Copy Changes</button>
           <button class="pj-live-btn pj-clear-log" id="pj-live-clear-log">Clear</button>
         </div>
@@ -1878,6 +2587,8 @@
     const copyChangesBtn = document.getElementById('pj-live-copy-changes');
     const p2rApplyNowBtn = document.getElementById('pj-p2r-apply-now');
     const p2rAutoToggleBtn = document.getElementById('pj-p2r-auto-toggle');
+    const p2rRoleHighlightBtn = document.getElementById('pj-p2r-role-highlight-toggle');
+    const p2rRoleFilterBtn = document.getElementById('pj-p2r-role-filter-toggle');
 
     let logs = GM_getValue(SCC_EXCEL_LOG_KEY, []);
 
@@ -1954,6 +2665,29 @@
       p2rAutoToggleBtn.style.background = enabled ? '#047857' : '#334155';
     }
 
+    function updateP2RRoleHighlightButton() {
+      if (!p2rRoleHighlightBtn) return;
+      const enabled = p2rRoleHighlightEnabled();
+      p2rRoleHighlightBtn.textContent = enabled ? 'Role Hover: ON' : 'Role Hover: OFF';
+      p2rRoleHighlightBtn.style.background = enabled ? '#7c3aed' : '#334155';
+    }
+
+    function updateP2RRoleFilterButton() {
+      if (!p2rRoleFilterBtn) return;
+      const mode = p2rRoleFilterMode();
+      p2rRoleFilterBtn.textContent = p2rRoleFilterLabel(mode);
+
+      const colours = {
+        all: '#334155',
+        pick: '#16a34a',
+        pack: '#2563eb',
+        both: '#7c3aed'
+      };
+
+      p2rRoleFilterBtn.style.background = colours[mode] || '#334155';
+      p2rRoleFilterBtn.style.color = '#fff';
+    }
+
     async function p2rApplyLatestFromHelper(sourceLabel = 'manual') {
       const latestLayout = GM_getValue(SCC_LAYOUT_KEY);
       return p2rApplySccLayout(latestLayout, statusBox, sourceLabel);
@@ -1980,6 +2714,10 @@
       if (isP2RTrackerPage() && p2rAutoApplyEnabled()) {
         setTimeout(() => p2rApplyLatestFromHelper('auto'), 250);
       }
+
+      if (isP2RTrackerPage() && p2rRoleHighlightEnabled()) {
+        setTimeout(() => p2rApplyRoleHighlights(statusBox), 350);
+      }
     });
 
     GM_addValueChangeListener(SCC_LAYOUT_KEY, (name, oldValue, newValue) => {
@@ -1991,6 +2729,10 @@
 
       if (isP2RTrackerPage() && p2rAutoApplyEnabled()) {
         setTimeout(() => p2rApplySccLayout(newValue, statusBox, 'auto'), 250);
+      }
+
+      if (isP2RTrackerPage() && p2rRoleHighlightEnabled()) {
+        setTimeout(() => p2rApplyRoleHighlights(statusBox), 350);
       }
     });
 
@@ -2028,6 +2770,38 @@
       });
     }
 
+    if (p2rRoleHighlightBtn) {
+      updateP2RRoleHighlightButton();
+      p2rRoleHighlightBtn.addEventListener('click', () => {
+        const next = !p2rRoleHighlightEnabled();
+        GM_setValue(P2R_ROLE_HIGHLIGHT_KEY, next);
+        updateP2RRoleHighlightButton();
+
+        if (next) {
+          p2rApplyRoleHighlights(statusBox);
+        } else {
+          p2rClearRoleHighlights(true);
+          statusBox.textContent = 'P2R Role Hover disabled.';
+        }
+      });
+    }
+
+    if (p2rRoleFilterBtn) {
+      updateP2RRoleFilterButton();
+      p2rRoleFilterBtn.addEventListener('click', () => {
+        const next = p2rNextRoleFilterMode();
+        GM_setValue(P2R_ROLE_FILTER_KEY, next);
+        updateP2RRoleFilterButton();
+
+        if (!p2rRoleHighlightEnabled()) {
+          GM_setValue(P2R_ROLE_HIGHLIGHT_KEY, true);
+          updateP2RRoleHighlightButton();
+        }
+
+        p2rApplyRoleHighlights(statusBox);
+      });
+    }
+
     const savedMin = localStorage.getItem(STORAGE_EXCEL_MINIMISED) === '1';
     if (savedMin) {
       panel.classList.add('min');
@@ -2045,6 +2819,11 @@
 
     if (isP2RTrackerPage() && p2rAutoApplyEnabled() && latest) {
       setTimeout(() => p2rApplySccLayout(latest, statusBox, 'auto'), 600);
+    }
+
+    if (isP2RTrackerPage()) {
+      updateP2RRoleHighlightButton();
+      startP2RRoleHighlightLoop(statusBox);
     }
 
     makePanelDraggable('pj-scc-live-window', '.pj-live-header', STORAGE_EXCEL_LEFT, STORAGE_EXCEL_TOP);
