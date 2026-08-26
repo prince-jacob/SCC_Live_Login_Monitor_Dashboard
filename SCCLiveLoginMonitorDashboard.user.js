@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCC Live Login Monitor Dashboard - NCL1
 // @namespace    prince-scc
-// @version      1.9.7
+// @version      1.9.8
 // @description  Auto-detect wall, copy Pick/Pack logins with FCLM links, track SCC login changes, and show live changes on OneDrive Excel and P2R Tracker pages, with optional P2R auto-apply, SCC trained-role capture, and compact P2R helper UI, persistent mini buttons, and strict one-at-a-time P2R Pick/P2R Pack filters. Upgraded dashboard UI.
 // @author       Prince Jacob ( Wprijaco )
 // @match        https://staffingcommandcenter-eu.aka.amazon.com/NCL1/*
@@ -28,8 +28,8 @@
   if (window.top !== window.self) return;
 
   const CREATOR = 'Prince Jacob ( Wprijaco )';
-  const SCRIPT_VERSION = '1.9.7';
-  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_9_7';
+  const SCRIPT_VERSION = '1.9.8';
+  const OFFICIAL_MARKER = 'OFFICIAL_SCC_LIVE_LOGIN_MONITOR_PRINCE_JACOB_V1_9_8';
 
   const SCC_CHANGE_KEY = 'pj_scc_live_login_changes';
   const SCC_LAYOUT_KEY = 'pj_scc_latest_layout';
@@ -891,18 +891,18 @@
         border: 0 !important;
         border-radius: 7px !important;
         height: 24px !important;
-        min-width: 62px !important;
-        padding: 0 7px !important;
+        min-width: 56px !important;
+        padding: 0 6px !important;
         background: #10b981 !important;
         color: #fff !important;
-        font-size: 10px !important;
+        font-size: 9.5px !important;
         font-weight: 900 !important;
         cursor: pointer !important;
         white-space: nowrap !important;
       }
 
       #pj-scc-live-window.pj-p2r-helper.min {
-        width: 292px !important;
+        width: 318px !important;
         min-width: 0 !important;
         height: auto !important;
       }
@@ -912,7 +912,7 @@
       }
 
       #pj-scc-live-window.pj-p2r-helper.min .pj-live-title {
-        max-width: 48px !important;
+        max-width: 38px !important;
         font-size: 11px !important;
       }
 
@@ -2756,6 +2756,7 @@
     }
 
     const filterMode = p2rRoleFilterMode();
+    let hoverReady = 0;
     let highlighted = 0;
     let matched = 0;
 
@@ -2765,17 +2766,23 @@
       const trained = normalizeTrainedRoles(info?.trained || info?.roles || []);
       if (!login || !trained.length) return;
 
-      if (!p2rRolePassesFilter(trained, filterMode)) return;
-
       const slot = tile.closest('.slot[data-role]');
       const boardRole = slot?.dataset?.role || '';
       const roleMatched = canDoP2RRole(trained, boardRole);
       const fullLabel = trained.map(trainedRoleLabel).join(', ');
       const category = p2rTrainingCategory(trained);
+      const passesFilter = p2rRolePassesFilter(trained, filterMode);
 
+      // Role ON means every login with SCC training data gets hover/tap role details.
+      // The Pick/Pack filter only controls which boxes receive the coloured border.
       tile.classList.add('pj-scc-role-trained');
-      tile.classList.add(filterMode === 'pack' ? 'pj-scc-role-filter-pack' : 'pj-scc-role-filter-pick');
-      tile.classList.add(roleMatched ? 'pj-scc-role-slot-match' : 'pj-scc-role-slot-mismatch');
+
+      if (passesFilter) {
+        tile.classList.add(filterMode === 'pack' ? 'pj-scc-role-filter-pack' : 'pj-scc-role-filter-pick');
+        tile.classList.add(roleMatched ? 'pj-scc-role-slot-match' : 'pj-scc-role-slot-mismatch');
+        highlighted += 1;
+        if (roleMatched) matched += 1;
+      }
 
       tile.setAttribute('data-pj-scc-login', login);
       tile.setAttribute('data-pj-scc-trained-roles', fullLabel);
@@ -2784,7 +2791,9 @@
       tile.setAttribute('data-pj-scc-role-match', roleMatched ? '1' : '0');
       tile.setAttribute('data-pj-scc-role-category', category);
       tile.setAttribute('data-pj-scc-filter-mode', filterMode);
-      tile.title = `${login} • ${p2rRoleFilterLabel(filterMode)} • ${fullLabel}`;
+      tile.title = passesFilter
+        ? `${login} • ${p2rRoleFilterLabel(filterMode)} highlighted • ${fullLabel}`
+        : `${login} • trained roles: ${fullLabel}`;
 
       tile.onmouseenter = event => {
         tile.classList.add('pj-scc-role-hovered');
@@ -2801,20 +2810,19 @@
       };
 
       tile.onclick = event => {
-        // Touch/tablet fallback: tap a highlighted tile to show the same role card longer.
+        // Touch/tablet fallback: tap any trained login to show the same role card longer.
         tile.classList.add('pj-scc-role-hovered');
         p2rShowRoleTooltip(tile, event);
         p2rScheduleRoleTooltipHide(tile, 9000);
       };
 
-      highlighted += 1;
-      if (roleMatched) matched += 1;
+      hoverReady += 1;
     });
 
     if (statusBox) {
       const colour = filterMode === 'pack' ? 'blue' : 'red';
       statusBox.textContent =
-        `${p2rRoleFilterLabel(filterMode)} filter: ${highlighted} login(s) highlighted with ${colour} border. ${matched} match current slot. Hover/tap a highlighted box for roles.`;
+        `Roles ON: hover works for ${hoverReady} trained login(s). ${p2rRoleFilterLabel(filterMode)} filter: ${highlighted} highlighted with ${colour} border, ${matched} match current slot.`;
     }
   }
 
@@ -2850,6 +2858,7 @@
         ${isP2RTrackerPage() ? `<div class="pj-live-mini-actions">
           <button class="pj-live-mini-btn" id="pj-p2r-apply-all-mini">All Floors</button>
           <button class="pj-live-mini-btn" id="pj-p2r-role-highlight-toggle-mini">Roles: OFF</button>
+          <button class="pj-live-mini-btn" id="pj-p2r-role-filter-toggle-mini">P2R Pick</button>
         </div>` : ``}
         <button class="pj-live-min" id="pj-live-min-btn">−</button>
       </div>
@@ -2897,6 +2906,7 @@
     const p2rRoleHighlightBtn = document.getElementById('pj-p2r-role-highlight-toggle');
     const p2rRoleHighlightMiniBtn = document.getElementById('pj-p2r-role-highlight-toggle-mini');
     const p2rRoleFilterBtn = document.getElementById('pj-p2r-role-filter-toggle');
+    const p2rRoleFilterMiniBtn = document.getElementById('pj-p2r-role-filter-toggle-mini');
 
     let logs = GM_getValue(SCC_EXCEL_LOG_KEY, []);
 
@@ -2982,11 +2992,12 @@
     }
 
     function updateP2RRoleFilterButton() {
-      if (!p2rRoleFilterBtn) return;
       const mode = p2rRoleFilterMode();
-      p2rRoleFilterBtn.textContent = p2rRoleFilterLabel(mode);
-      p2rRoleFilterBtn.style.background = mode === 'pack' ? '#2563eb' : '#dc2626';
-      p2rRoleFilterBtn.style.color = '#fff';
+      [p2rRoleFilterBtn, p2rRoleFilterMiniBtn].filter(Boolean).forEach(btn => {
+        btn.textContent = p2rRoleFilterLabel(mode);
+        btn.style.background = mode === 'pack' ? '#2563eb' : '#dc2626';
+        btn.style.color = '#fff';
+      });
     }
 
     async function p2rApplyLatestFromHelper(sourceLabel = 'manual') {
@@ -3113,9 +3124,9 @@
 
     updateP2RRoleHighlightButton();
 
-    if (p2rRoleFilterBtn) {
-      updateP2RRoleFilterButton();
-      p2rRoleFilterBtn.addEventListener('click', () => {
+    [p2rRoleFilterBtn, p2rRoleFilterMiniBtn].filter(Boolean).forEach(btn => {
+      btn.addEventListener('click', event => {
+        event.stopPropagation();
         const next = p2rNextRoleFilterMode();
         GM_setValue(P2R_ROLE_FILTER_KEY, next);
         updateP2RRoleFilterButton();
@@ -3127,7 +3138,9 @@
 
         p2rApplyRoleHighlights(statusBox);
       });
-    }
+    });
+
+    updateP2RRoleFilterButton();
 
     const savedMin = localStorage.getItem(STORAGE_EXCEL_MINIMISED) === '1';
     if (savedMin) {
